@@ -253,7 +253,7 @@ h2 span,
 .checkpoint-loader {
   display: grid;
   gap: 6px;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
 }
 
 .checkpoint-select {
@@ -586,7 +586,7 @@ h2 span,
   }
 
   .checkpoint-loader {
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1fr 1fr 1fr;
   }
 
   .checkpoint-select {

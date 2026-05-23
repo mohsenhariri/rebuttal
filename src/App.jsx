@@ -5,6 +5,7 @@ import {
   FileText,
   RotateCcw,
   Save,
+  Share2,
   SplitSquareHorizontal,
   Trash2,
 } from 'lucide-react'
@@ -12,9 +13,14 @@ import { hasLikelyUnescapedTexLineBreak, renderOpenReviewMarkdown } from './open
 
 const DRAFT_KEY = 'oply-rebuttal-draft-v1'
 const CHECKPOINTS_KEY = 'oply-rebuttal-checkpoints-v1'
+const SHARE_HASH_PARAM = 'checkpoint'
 const MAX_COMMENT_LENGTH = 5000
+const MAX_IMPORTED_COMMENT_LENGTH = 20000
 const MAX_CHECKPOINTS = 50
 const MAX_CHECKPOINT_LABEL_LENGTH = 80
+
+const textEncoder = new TextEncoder()
+const textDecoder = new TextDecoder()
 
 const defaultDraft = {
   title: '',
@@ -62,6 +68,148 @@ function loadCheckpoints() {
 
 function createCheckpointId() {
   return window.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+function bytesToBase64Url(bytes) {
+  let binary = ''
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte)
+  }
+
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/u, '')
+}
+
+function base64UrlToBytes(value) {
+  const base64 = value.replace(/-/gu, '+').replace(/_/gu, '/')
+  const paddedBase64 = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '=')
+  const binary = atob(paddedBase64)
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0))
+}
+
+function encodeJson(value) {
+  return bytesToBase64Url(textEncoder.encode(JSON.stringify(value)))
+}
+
+function decodeJson(value) {
+  return JSON.parse(textDecoder.decode(base64UrlToBytes(value)))
+}
+
+function canUseCheckpointSharing() {
+  return Boolean(window.crypto?.subtle && window.crypto?.getRandomValues)
+}
+
+function getShareTokenFromHash() {
+  const hash = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : ''
+  if (!hash) return ''
+
+  return new URLSearchParams(hash).get(SHARE_HASH_PARAM) ?? ''
+}
+
+function removeShareTokenFromAddressBar() {
+  const url = new URL(window.location.href)
+  const hash = url.hash.startsWith('#') ? url.hash.slice(1) : ''
+  const params = new URLSearchParams(hash)
+  params.delete(SHARE_HASH_PARAM)
+
+  const remainingHash = params.toString()
+  const nextUrl = `${url.pathname}${url.search}${remainingHash ? `#${remainingHash}` : ''}`
+  window.history.replaceState(null, '', nextUrl)
+}
+
+function validateSharedCheckpoint(payload) {
+  if (!payload || payload.type !== 'oply-rebuttal-checkpoint' || payload.v !== 1) {
+    throw new Error('Unsupported checkpoint link')
+  }
+
+  const label =
+    typeof payload.label === 'string'
+      ? payload.label.slice(0, MAX_CHECKPOINT_LABEL_LENGTH)
+      : 'Shared checkpoint'
+  const title = typeof payload.title === 'string' ? payload.title.slice(0, MAX_IMPORTED_COMMENT_LENGTH) : ''
+  const comment = typeof payload.comment === 'string' ? payload.comment : ''
+  const createdAt =
+    typeof payload.createdAt === 'string' ? payload.createdAt : new Date().toISOString()
+
+  if (comment.length > MAX_IMPORTED_COMMENT_LENGTH) {
+    throw new Error('Checkpoint content is too large')
+  }
+
+  return {
+    label: label.trim() || 'Shared checkpoint',
+    title,
+    comment,
+    createdAt,
+  }
+}
+
+async function createEncryptedCheckpointLink(checkpoint) {
+  if (!canUseCheckpointSharing()) {
+    throw new Error('Encrypted checkpoint links are not supported in this browser')
+  }
+
+  const key = await window.crypto.subtle.generateKey(
+    { name: 'AES-GCM', length: 256 },
+    true,
+    ['encrypt', 'decrypt'],
+  )
+  const iv = window.crypto.getRandomValues(new Uint8Array(12))
+  const payload = {
+    v: 1,
+    type: 'oply-rebuttal-checkpoint',
+    label: checkpoint.label,
+    title: checkpoint.title,
+    comment: checkpoint.comment,
+    createdAt: checkpoint.createdAt,
+    exportedAt: new Date().toISOString(),
+  }
+  const encryptedPayload = await window.crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    textEncoder.encode(JSON.stringify(payload)),
+  )
+  const exportedKey = await window.crypto.subtle.exportKey('raw', key)
+  const envelope = {
+    v: 1,
+    alg: 'A256GCM',
+    iv: bytesToBase64Url(iv),
+    data: bytesToBase64Url(new Uint8Array(encryptedPayload)),
+  }
+  const token = `${encodeJson(envelope)}.${bytesToBase64Url(new Uint8Array(exportedKey))}`
+  const url = new URL(window.location.href)
+  url.hash = `${SHARE_HASH_PARAM}=${token}`
+
+  return url.toString()
+}
+
+async function decryptSharedCheckpointToken(token) {
+  if (!canUseCheckpointSharing()) {
+    throw new Error('Encrypted checkpoint links are not supported in this browser')
+  }
+
+  const parts = token.split('.')
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    throw new Error('Invalid checkpoint link')
+  }
+
+  const envelope = decodeJson(parts[0])
+  if (envelope?.v !== 1 || envelope?.alg !== 'A256GCM') {
+    throw new Error('Unsupported checkpoint link')
+  }
+
+  const key = await window.crypto.subtle.importKey(
+    'raw',
+    base64UrlToBytes(parts[1]),
+    { name: 'AES-GCM' },
+    false,
+    ['decrypt'],
+  )
+  const decryptedPayload = await window.crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: base64UrlToBytes(envelope.iv) },
+    key,
+    base64UrlToBytes(envelope.data),
+  )
+
+  return validateSharedCheckpoint(JSON.parse(textDecoder.decode(decryptedPayload)))
 }
 
 function formatCheckpointDate(dateString) {
@@ -138,10 +286,12 @@ function App() {
   const [lastSavedAt, setLastSavedAt] = useState(null)
   const [actionStatus, setActionStatus] = useState('')
   const actionStatusTimerRef = useRef(null)
+  const shareImportAttemptedRef = useRef(false)
 
   const commentLength = draft.comment.trim().length
   const remainingCharacters = MAX_COMMENT_LENGTH - commentLength
   const isDraftEmpty = draft.title.trim().length === 0 && draft.comment.trim().length === 0
+  const isCheckpointSharingSupported = canUseCheckpointSharing()
   const activeCheckpoint = useMemo(
     () => checkpoints.find((checkpoint) => checkpoint.id === activeCheckpointId),
     [activeCheckpointId, checkpoints],
@@ -194,6 +344,48 @@ function App() {
   }, [checkpoints, selectedCheckpointId])
 
   useEffect(() => {
+    if (shareImportAttemptedRef.current) return
+    shareImportAttemptedRef.current = true
+
+    const token = getShareTokenFromHash()
+    if (!token) return
+
+    const importSharedCheckpoint = async () => {
+      try {
+        const sharedCheckpoint = await decryptSharedCheckpointToken(token)
+
+        removeShareTokenFromAddressBar()
+
+        const shouldImport = window.confirm(
+          `Import shared checkpoint "${sharedCheckpoint.label}"? Your current autosaved draft will be replaced.`,
+        )
+        if (!shouldImport) return
+
+        const checkpoint = {
+          id: createCheckpointId(),
+          ...sharedCheckpoint,
+        }
+
+        setCheckpoints((currentCheckpoints) =>
+          [checkpoint, ...currentCheckpoints].slice(0, MAX_CHECKPOINTS),
+        )
+        setDraft({
+          title: checkpoint.title,
+          comment: checkpoint.comment,
+        })
+        setActiveCheckpointId(checkpoint.id)
+        setSelectedCheckpointId(checkpoint.id)
+        showActionStatus(`Imported checkpoint "${checkpoint.label}"`)
+      } catch {
+        removeShareTokenFromAddressBar()
+        showActionStatus('Could not open encrypted checkpoint link')
+      }
+    }
+
+    importSharedCheckpoint()
+  }, [])
+
+  useEffect(() => {
     return () => {
       if (actionStatusTimerRef.current) {
         window.clearTimeout(actionStatusTimerRef.current)
@@ -218,6 +410,28 @@ function App() {
     }
     await navigator.clipboard.writeText(JSON.stringify(payload, null, 2))
     showActionStatus('Copied draft payload')
+  }
+
+  const copySelectedCheckpointShareLink = async () => {
+    if (!selectedCheckpoint) return
+
+    const shouldShare = window.confirm(
+      `Create an encrypted link for checkpoint "${selectedCheckpoint.label}"? Anyone with the full link can read it.`,
+    )
+    if (!shouldShare) return
+
+    try {
+      const shareLink = await createEncryptedCheckpointLink(selectedCheckpoint)
+      try {
+        await navigator.clipboard.writeText(shareLink)
+        showActionStatus('Copied encrypted checkpoint link')
+      } catch {
+        window.prompt('Copy encrypted checkpoint link:', shareLink)
+        showActionStatus('Created encrypted checkpoint link')
+      }
+    } catch {
+      showActionStatus('Could not create encrypted checkpoint link')
+    }
   }
 
   const saveCheckpoint = (event) => {
@@ -389,6 +603,20 @@ function App() {
                 >
                   <Trash2 size={16} aria-hidden="true" />
                   Delete
+                </button>
+                <button
+                  type="button"
+                  className="icon-button"
+                  onClick={copySelectedCheckpointShareLink}
+                  disabled={!selectedCheckpoint || !isCheckpointSharingSupported}
+                  title={
+                    isCheckpointSharingSupported
+                      ? 'Copy encrypted checkpoint link'
+                      : 'Encrypted checkpoint links are not supported in this browser'
+                  }
+                >
+                  <Share2 size={16} aria-hidden="true" />
+                  Share
                 </button>
               </div>
             </div>
